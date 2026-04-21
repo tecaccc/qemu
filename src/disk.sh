@@ -701,6 +701,90 @@ if [ -f "$RESCUE" ] && [ -s "$RESCUE" ]; then
   DISK_OPTS+=$(addMedia "$RESCUE" "$FALLBACK" "1" "0x6")
 fi
 
+# Cloud-init: auto-generate cidata ISO if config files exist
+CLOUDINIT_DIR="$STORAGE/cloud-init"
+
+# Auto-create directory when cloud-init env vars are set
+if [ ! -d "$CLOUDINIT_DIR" ] && [ -n "${CLOUD_USER:-}" ]; then
+  mkdir -p "$CLOUDINIT_DIR"
+fi
+
+if [ -d "$CLOUDINIT_DIR" ]; then
+
+  CLOUDINIT_ISO="$STORAGE/cloud-init.iso"
+
+  # Always regenerate meta-data with unique instance-id
+  cloud_instance_id="$(cat /proc/sys/kernel/random/uuid)"
+  cat > "$CLOUDINIT_DIR/meta-data" << METADATA
+instance-id: ${cloud_instance_id}
+local-hostname: ${HOST}
+METADATA
+
+  # Generate user-data from environment variables if file is missing
+  if [ ! -f "$CLOUDINIT_DIR/user-data" ] && [ -n "${CLOUD_USER:-}" ]; then
+    ssh_keys_block=""
+    if [ -n "${CLOUD_SSH_KEY:-}" ]; then
+      ssh_keys_block="
+    ssh_authorized_keys:
+      - ${CLOUD_SSH_KEY}"
+    fi
+    cat > "$CLOUDINIT_DIR/user-data" << USERDATA
+#cloud-config
+hostname: ${HOST}
+ssh_pwauth: true
+users:
+  - name: ${CLOUD_USER}
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    plain_text_passwd: ${CLOUD_PASS:-$CLOUD_USER}${ssh_keys_block}
+USERDATA
+  fi
+
+  # Always regenerate network-config from environment variables
+  if [ -n "${CLOUD_IP:-}" ]; then
+    cloud_gateway="${CLOUD_GW:-}"
+    [ -z "$cloud_gateway" ] && cloud_gateway="${CLOUD_IP%.*}.1"
+    cloud_dns="${CLOUD_DNS:-}"
+    [ -z "$cloud_dns" ] && cloud_dns="$cloud_gateway"
+    cat > "$CLOUDINIT_DIR/network-config" << NETCFG
+version: 2
+ethernets:
+  eth0:
+    addresses:
+      - ${CLOUD_IP}
+    routes:
+      - to: 0.0.0.0/0
+        via: ${cloud_gateway}
+    nameservers:
+      addresses:
+        - ${cloud_dns}
+NETCFG
+  fi
+
+  # Generate ISO (requires user-data at minimum)
+  if [ -f "$CLOUDINIT_DIR/user-data" ]; then
+    msg="Generating cloud-init ISO..."
+    html "$msg"
+    [[ "$DEBUG" == [Yy1]* ]] && info "$msg"
+
+    graft="meta-data=$CLOUDINIT_DIR/meta-data user-data=$CLOUDINIT_DIR/user-data"
+    [ -f "$CLOUDINIT_DIR/network-config" ] && graft+=" network-config=$CLOUDINIT_DIR/network-config"
+
+    if ! genisoimage -output "$CLOUDINIT_ISO" \
+      -volid cidata -joliet -rock \
+      -graft-points $graft 2>/dev/null; then
+      warn "Failed to generate cloud-init ISO"
+    fi
+  fi
+
+  # Attach cloud-init ISO as CD-ROM
+  if [ -f "$CLOUDINIT_ISO" ] && [ -s "$CLOUDINIT_ISO" ]; then
+    DISK_OPTS+=$(addMedia "$CLOUDINIT_ISO" "$FALLBACK" "" "0x7")
+  fi
+
+fi
+
 DISK1_FILE="$STORAGE/${DISK_NAME}"
 DISK2_FILE="/storage2/${DISK_NAME}2"
 DISK3_FILE="/storage3/${DISK_NAME}3"

@@ -15,3 +15,64 @@ services:
       - ./qemu:/storage
     restart: always
     stop_grace_period: 2m
+
+  # Host bridge mode: TAP attached to a host bridge (e.g. br0)
+  # Requires: host bridge already exists on the host with DHCP
+  # NOTE: When running multiple VMs in host mode, each must use unique ports:
+  #   WEB_PORT (default 8006), VNC_PORT (5900), WSS_PORT (5700),
+  #   WSD_PORT (8004), MON_PORT (7100)
+  #
+  # Cloud-init supports two modes:
+  #   1) Environment variables (CLOUD_USER, CLOUD_PASS, CLOUD_IP, etc.)
+  #   2) Manual files in ./qemu/cloud-init/ directory
+  #      (user-data required, meta-data and network-config optional)
+  #   Env vars are ignored when corresponding files already exist.
+  #
+  # qemu-host-1:
+  #   image: qemux/qemu
+  #   container_name: qemu-1
+  #   network_mode: host
+  #   environment:
+  #     BOOT: "ubuntu"
+  #     NETWORK: "host"
+  #     HOST_BRIDGE: "br0"
+  #     CLOUD_USER: "admin"
+  #     CLOUD_PASS: "secret"
+  #     CLOUD_IP: "192.168.1.100/24"
+  #     CLOUD_GW: "192.168.1.1"
+  #     CLOUD_DNS: "8.8.8.8"
+  #   devices:
+  #     - /dev/kvm
+  #     - /dev/net/tun
+  #   cap_add:
+  #     - NET_ADMIN
+  #   volumes:
+  #     - ./qemu1:/storage
+  #   restart: always
+  #   stop_grace_period: 2m
+  #
+  # qemu-host-2:
+  #   image: qemux/qemu
+  #   container_name: qemu-2
+  #   network_mode: host
+  #   environment:
+  #     BOOT: "debian"
+  #     NETWORK: "host"
+  #     HOST_BRIDGE: "br0"
+  #     CLOUD_USER: "admin"
+  #     CLOUD_PASS: "secret"
+  #     CLOUD_IP: "192.168.1.101/24"
+  #     WEB_PORT: "8016"
+  #     VNC_PORT: "5910"
+  #     WSS_PORT: "5710"
+  #     WSD_PORT: "8014"
+  #     MON_PORT: "7110"
+  #   devices:
+  #     - /dev/kvm
+  #     - /dev/net/tun
+  #   cap_add:
+  #     - NET_ADMIN
+  #   volumes:
+  #     - ./qemu2:/storage
+  #   restart: always
+  #   stop_grace_period: 2m

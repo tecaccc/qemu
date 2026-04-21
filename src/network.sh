@@ -25,6 +25,8 @@ set -Eeuo pipefail
 : "${PASST_DEBUG:=""}"
 : "${PASST_PID:="/var/run/passt.pid"}"
 
+: "${HOST_BRIDGE:=""}"
+
 : "${DNSMASQ_OPTS:=""}"
 : "${DNSMASQ_DEBUG:=""}"
 : "${DNSMASQ:="/usr/sbin/dnsmasq"}"
@@ -592,6 +594,89 @@ configureNAT() {
   return 0
 }
 
+configureHostBridge() {
+
+  [[ "$DEBUG" == [Yy1]* ]] && echo "Configuring host bridge networking..."
+
+  if [ -z "$HOST_BRIDGE" ]; then
+    error "HOST_BRIDGE is not set. Please specify the host bridge name (e.g. HOST_BRIDGE=br0)."
+    return 1
+  fi
+
+  if [ ! -d "/sys/class/net/$HOST_BRIDGE" ]; then
+    error "Host bridge '$HOST_BRIDGE' does not exist on the host!"
+    return 1
+  fi
+
+  if [ ! -d "/sys/class/net/$HOST_BRIDGE/bridge" ]; then
+    error "'$HOST_BRIDGE' is not a bridge device!"
+    return 1
+  fi
+
+  # Auto-generate a unique TAP name based on VM MAC address to avoid conflicts
+  # Linux interface names are limited to 15 chars and must be lowercase
+  if [[ "$VM_NET_TAP" == "qemu" ]]; then
+    VM_NET_TAP="tap-${VM_NET_MAC//:}"         # e.g. tap-02B841916017
+    VM_NET_TAP="${VM_NET_TAP,,}"              # lowercase: tap-02b841916017
+    VM_NET_TAP="${VM_NET_TAP:0:15}"           # truncate to 15 chars: tap-02b84191601
+  fi
+
+  # Create the necessary file structure for /dev/net/tun
+  if [ ! -c /dev/net/tun ]; then
+    [ ! -d /dev/net ] && mkdir -m 755 /dev/net
+    if mknod /dev/net/tun c 10 200; then
+      chmod 666 /dev/net/tun
+    fi
+  fi
+
+  if [ ! -c /dev/net/tun ]; then
+    error "TUN device is missing. $ADD_ERR --device /dev/net/tun"
+    return 1
+  fi
+
+  # Clean up lingering TAP device from a previous run
+  if [[ -d "/sys/class/net/$VM_NET_TAP" ]]; then
+    ip link delete "$VM_NET_TAP" 2>/dev/null || true
+  fi
+
+  # Create a TAP device
+  if ! ip tuntap add dev "$VM_NET_TAP" mode tap; then
+    error "Failed to create TAP device '$VM_NET_TAP'."
+    return 1
+  fi
+
+  if [[ "$MTU" != "0" && "$MTU" != "1500" ]]; then
+    if ! ip link set dev "$VM_NET_TAP" mtu "$MTU"; then
+      warn "Failed to set MTU size to $MTU."
+    fi
+  fi
+
+  while ! ip link set "$VM_NET_TAP" up promisc on; do
+    info "Waiting for TAP to become available..."
+    sleep 2
+  done
+
+  # Attach TAP to the host bridge
+  if ! ip link set dev "$VM_NET_TAP" master "$HOST_BRIDGE"; then
+    error "Failed to attach TAP '$VM_NET_TAP' to host bridge '$HOST_BRIDGE'."
+    ip link delete "$VM_NET_TAP" || true
+    return 1
+  fi
+
+  [[ "$DEBUG" == [Yy1]* ]] && info "TAP '$VM_NET_TAP' attached to host bridge '$HOST_BRIDGE'"
+
+  NET_OPTS="-netdev tap,id=hostnet0,ifname=$VM_NET_TAP"
+
+  if [ -c /dev/vhost-net ]; then
+    { exec 40>>/dev/vhost-net; rc=$?; } 2>/dev/null || :
+    (( rc == 0 )) && NET_OPTS+=",vhost=on,vhostfd=40"
+  fi
+
+  NET_OPTS+=",script=no,downscript=no"
+
+  return 0
+}
+
 closeBridge() {
 
   [ -s "$PASST_PID" ] && pKill "$(<"$PASST_PID")"
@@ -607,8 +692,11 @@ closeBridge() {
   ip link set "$VM_NET_TAP" down promisc off &> null || true
   ip link delete "$VM_NET_TAP" &> null || true
 
-  ip link set "$VM_NET_BRIDGE" down &> null || true
-  ip link delete "$VM_NET_BRIDGE" &> null || true
+  # Only delete the internal bridge in NAT mode (not host bridge mode)
+  if [[ -z "$HOST_BRIDGE" ]]; then
+    ip link set "$VM_NET_BRIDGE" down &> null || true
+    ip link delete "$VM_NET_BRIDGE" &> null || true
+  fi
 
   return 0
 }
@@ -726,10 +814,12 @@ getInfo() {
   nic=$(grep -m 1 -i 'driver:' <<< "$result" | awk '{print $(2)}')
   bus=$(grep -m 1 -i 'bus-info:' <<< "$result" | awk '{print $(2)}')
 
-  if [[ "${bus,,}" != "" && "${bus,,}" != "n/a" && "${bus,,}" != "tap" ]]; then
-    [[ "$DEBUG" == [Yy1]* ]] && info "Detected BUS: $bus"
-    error "This container does not support host mode networking!"
-    exit 29
+  if [[ "${NETWORK,,}" != "host"* ]]; then
+    if [[ "${bus,,}" != "" && "${bus,,}" != "n/a" && "${bus,,}" != "tap" ]]; then
+      [[ "$DEBUG" == [Yy1]* ]] && info "Detected BUS: $bus"
+      error "This container does not support host mode networking!"
+      exit 29
+    fi
   fi
 
   if [[ "$DHCP" == [Yy1]* ]]; then
@@ -841,6 +931,7 @@ else
 
   case "${NETWORK,,}" in
     "passt" | "slirp" | "user"* ) ;;
+    "host"* ) ;;
     "tap" | "tun" | "tuntap" | "y" | "" )
 
       # Configure tap interface
@@ -861,6 +952,13 @@ else
 
   case "${NETWORK,,}" in
     "tap" | "tun" | "tuntap" | "y" | "" ) ;;
+    "host"* )
+
+      # Configure TAP attached to host bridge
+      if ! configureHostBridge; then
+        error "Failed to configure host bridge networking!"
+        exit 20
+      fi ;;
     "passt" | "user"* )
 
       # Configure for user-mode networking (passt)
