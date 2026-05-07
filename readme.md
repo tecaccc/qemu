@@ -311,6 +311,100 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
     - 'c *:* rwm'
   ```
 
+### How do I use host bridge networking?
+
+  If you want the VM to be directly connected to your physical network, you can use host bridge networking. This mode creates a TAP device and attaches it to an existing host bridge (e.g. `br0`), giving the VM its own presence on the network.
+
+  > [!NOTE]
+  > This mode has currently only been tested with the `Rocky-9-GenericCloud-Base.latest.x86_64.qcow2` image.
+
+  First, make sure you have a bridge configured on your host (e.g. `br0`):
+
+  ```bash
+  sudo ip link add name br0 type bridge
+  sudo ip link set eth0 master br0
+  sudo ip link set br0 up
+  ```
+
+  Then configure your compose file:
+
+  ```yaml
+  services:
+    qemu:
+      image: qemux/qemu
+      container_name: qemu
+      network_mode: host
+      environment:
+        BOOT: "ubuntu"
+        NETWORK: "host"
+        HOST_BRIDGE: "br0"
+      devices:
+        - /dev/kvm
+        - /dev/net/tun
+      cap_add:
+        - NET_ADMIN
+      volumes:
+        - ./qemu:/storage
+      restart: always
+      stop_grace_period: 2m
+  ```
+
+> [!IMPORTANT]
+> Host bridge mode requires `network_mode: host` and the host bridge must already exist before starting the container.
+
+  When running multiple VMs in host bridge mode, each must use unique ports:
+
+  ```yaml
+  environment:
+    WEB_PORT: "8016"    # default: 8006
+    VNC_PORT: "5910"    # default: 5900
+    WSS_PORT: "5710"    # default: 5700
+    WSD_PORT: "8014"    # default: 8004
+    MON_PORT: "7110"    # default: 7100
+  ```
+
+### How do I use cloud-init?
+
+  Cloud-init allows you to automatically configure the VM on first boot (set hostname, create users, configure network, etc.). It works especially well with [host bridge networking](#how-do-i-use-host-bridge-networking).
+
+  **Using environment variables:**
+
+  ```yaml
+  environment:
+    CLOUD_USER: "admin"
+    CLOUD_PASS: "secret"
+    CLOUD_IP: "192.168.1.100/24"
+    CLOUD_GW: "192.168.1.1"
+    CLOUD_DNS: "8.8.8.8"
+    CLOUD_SSH_KEY: "ssh-rsa AAAA... user@host"
+  ```
+
+  | **Variable**     | **Description**                          |
+  |---|---|
+  | `CLOUD_USER`     | Username to create (required)            |
+  | `CLOUD_PASS`     | Password for the user (defaults to username) |
+  | `CLOUD_IP`       | Static IP address with CIDR (e.g. `192.168.1.100/24`) |
+  | `CLOUD_GW`       | Gateway address (auto-detected if omitted) |
+  | `CLOUD_DNS`      | DNS server (defaults to gateway if omitted) |
+  | `CLOUD_SSH_KEY`  | SSH public key to authorize              |
+
+  **Using manual config files:**
+
+  Alternatively, you can place cloud-init config files in the `./qemu/cloud-init/` directory:
+
+  ```yaml
+  volumes:
+    - ./qemu:/storage
+  ```
+
+  Then create the following files inside `./qemu/cloud-init/`:
+
+  - `user-data` (required) — Cloud-config for user creation, packages, etc.
+  - `meta-data` (optional) — Auto-generated if missing
+  - `network-config` (optional) — Auto-generated from `CLOUD_*` variables if missing
+
+  Environment variables are ignored when the corresponding files already exist, giving you full control when needed.
+
 ### How do I add multiple disks?
 
   To create additional disks, modify your compose file like this:

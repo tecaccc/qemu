@@ -470,6 +470,7 @@ addDisk () {
   local DISK_FMT="$7"
   local DISK_IO="$8"
   local DISK_CACHE="$9"
+  local DISK_SERIAL="${10:-}"
   local DISK_EXT DIR SPACE GB DATA_SIZE FS PREV_FMT PREV_EXT CUR_SIZE LEFT FREE USED
 
   DISK_EXT=$(fmt2ext "$DISK_FMT")
@@ -592,7 +593,9 @@ addDisk () {
     fi
   fi
 
-  DISK_OPTS+=$(createDevice "$DISK_FILE" "$DISK_TYPE" "$DISK_INDEX" "$DISK_ADDRESS" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" "" "")
+  local serial_arg=""
+  [ -n "$DISK_SERIAL" ] && serial_arg=",serial=$DISK_SERIAL"
+  DISK_OPTS+=$(createDevice "$DISK_FILE" "$DISK_TYPE" "$DISK_INDEX" "$DISK_ADDRESS" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" "$serial_arg" "")
 
   return 0
 }
@@ -713,6 +716,8 @@ if [ -d "$CLOUDINIT_DIR" ]; then
 
   CLOUDINIT_ISO="$STORAGE/cloud-init.iso"
 
+  if [ ! -f "$CLOUDINIT_ISO" ] || [ ! -s "$CLOUDINIT_ISO" ]; then
+
   # Always regenerate meta-data with unique instance-id
   cloud_instance_id="$(cat /proc/sys/kernel/random/uuid)"
   cat > "$CLOUDINIT_DIR/meta-data" << METADATA
@@ -722,6 +727,18 @@ METADATA
 
   # Generate user-data from environment variables if file is missing
   if [ ! -f "$CLOUDINIT_DIR/user-data" ] && [ -n "${CLOUD_USER:-}" ]; then
+
+    # Determine stable disk device path by QEMU serial for fs_setup
+    cloud_disk_dev=""
+    case "${DISK_TYPE,,}" in
+      "blk" | "virtio-blk" )
+        cloud_disk_dev="/dev/disk/by-id/virtio-sddata" ;;
+      "scsi" | "virtio-scsi" | "" )
+        cloud_disk_dev="/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_sddata" ;;
+      * )
+        cloud_disk_dev="/dev/sdb" ;;
+    esac
+
     ssh_keys_block=""
     if [ -n "${CLOUD_SSH_KEY:-}" ]; then
       ssh_keys_block="
@@ -732,6 +749,13 @@ METADATA
 #cloud-config
 hostname: ${HOST}
 ssh_pwauth: true
+fs_setup:
+  - label: sddata
+    device: ${cloud_disk_dev}
+    filesystem: ext4
+    overwrite: false
+mounts:
+  - [ LABEL=sddata, /data, auto, "defaults,nofail", "0", "2" ]
 users:
   - name: ${CLOUD_USER}
     lock_passwd: false
@@ -776,6 +800,8 @@ NETCFG
       -graft-points $graft 2>/dev/null; then
       warn "Failed to generate cloud-init ISO"
     fi
+  fi
+
   fi
 
   # Attach cloud-init ISO as CD-ROM
@@ -843,7 +869,7 @@ fi
 if [ -n "$DEVICE" ]; then
   addDevice "$DEVICE" "$DISK_TYPE" "3" "0xa" || exit $?
 else
-  addDisk "$DISK1_FILE" "$DISK_TYPE" "disk" "$DISK_SIZE" "3" "0xa" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" || exit $?
+  addDisk "$DISK1_FILE" "$DISK_TYPE" "disk" "$DISK_SIZE" "3" "0xa" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" "sddata" || exit $?
 fi
 
 if [ -n "$DEVICE2" ]; then

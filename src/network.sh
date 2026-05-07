@@ -613,12 +613,12 @@ configureHostBridge() {
     return 1
   fi
 
-  # Auto-generate a unique TAP name based on VM MAC address to avoid conflicts
+  # Auto-generate a unique TAP name based on MAC address to avoid conflicts
   # Linux interface names are limited to 15 chars and must be lowercase
   if [[ "$VM_NET_TAP" == "qemu" ]]; then
-    VM_NET_TAP="tap-${VM_NET_MAC//:}"         # e.g. tap-02B841916017
-    VM_NET_TAP="${VM_NET_TAP,,}"              # lowercase: tap-02b841916017
-    VM_NET_TAP="${VM_NET_TAP:0:15}"           # truncate to 15 chars: tap-02b84191601
+    VM_NET_TAP="tap-${VM_NET_MAC//:}"
+    VM_NET_TAP="${VM_NET_TAP,,}"
+    VM_NET_TAP="${VM_NET_TAP:0:15}"
   fi
 
   # Create the necessary file structure for /dev/net/tun
@@ -871,8 +871,8 @@ getInfo() {
     [ -s "$file" ] && MAC=$(<"$file")
     MAC="${MAC//[![:print:]]/}"
     if [ -z "$MAC" ]; then
-      # Generate MAC address based on Docker container ID in hostname
-      MAC=$(echo "$HOST" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
+      # Generate MAC address with random salt to ensure uniqueness across multiple VMs
+      MAC=$(echo "$HOST:$RANDOM:$RANDOM" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
       echo "${MAC^^}" > "$file"
       ! setOwner "$file" && error "Failed to set the owner for \"$file\" !"
     fi
