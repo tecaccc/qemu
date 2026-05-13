@@ -100,8 +100,8 @@ next_available_port() {
 IP_SUBNET="10.50.1"
 IP_START=10
 IP_END=254
-PING_TIMEOUT=0.1
-SCAN_CONCURRENCY=3
+PING_TIMEOUT=0.5
+SCAN_CONCURRENCY=32
 
 # 快速检查: VM 配置 + ARP (毫秒级, 不需要 ping)
 collect_known_ips() {
@@ -124,12 +124,12 @@ collect_known_ips() {
   printf '%s\n' "${known[@]}" | sort -u
 }
 
-# 并发探测: 每批 SCAN_CONCURRENCY 个, 实时输出结果
-# 每发现一个未使用的 IP 就暂停询问用户
+# 并发探测: 高并发全量扫描，完成后展示汇总表格供用户选择
 interactive_ip_scan() {
   local subnet="$1"
+  local total=$((IP_END - IP_START + 1))
 
-  # 先快速收集已知 IP
+  # 快速收集已知 IP
   local known_list
   known_list=$(collect_known_ips "$subnet")
 
@@ -137,34 +137,35 @@ interactive_ip_scan() {
     echo -e "\n  ${BOLD}已知占用的 IP (来自 VM 配置 / ARP 表):${NC}"
     while IFS= read -r ip; do
       [ -n "$ip" ] || continue
-      echo -e "    ${RED}● ${ip}  已占用${NC}"
+      echo -e "    ${RED}● ${ip}${NC}"
     done <<< "$known_list"
   fi
 
-  # 将已知 IP 写入临时文件供后续比对
-  local known_file
-  known_file=$(mktemp)
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  # 将已知 IP 写入文件，避免每个子 shell 重复管道开销
+  local known_file="${tmpdir}/known"
   [ -n "$known_list" ] && echo "$known_list" > "$known_file" || : > "$known_file"
 
-  echo -e "\n  ${BOLD}开始并发探测 ${subnet}.${IP_START} ~ ${subnet}.${IP_END} (每批 ${SCAN_CONCURRENCY} 个)...${NC}"
-  echo ""
+  echo -e "\n  ${BOLD}开始并发探测 ${subnet}.${IP_START} ~ ${subnet}.${IP_END} (并发 ${SCAN_CONCURRENCY})...${NC}\n"
 
+  local scanned=0
   local h
+
   for ((h = IP_START; h <= IP_END; )); do
-    # 取一批
     local batch=()
     local b
     for ((b = 0; b < SCAN_CONCURRENCY && h <= IP_END; b++, h++)); do
       batch+=("$h")
     done
 
-    # 并发 ping 这一批
-    local results=()
-    local tmpdir
-    tmpdir=$(mktemp -d)
     for host_num in "${batch[@]}"; do
       (
-        if ping -c 1 -W "${PING_TIMEOUT}" "${subnet}.${host_num}" &>/dev/null; then
+        local ip="${subnet}.${host_num}"
+        if grep -qx "$ip" "$known_file" 2>/dev/null; then
+          echo "used" > "${tmpdir}/${host_num}"
+        elif timeout "${PING_TIMEOUT}" ping -c 1 -W 1 "${ip}" &>/dev/null; then
           echo "used" > "${tmpdir}/${host_num}"
         else
           echo "free" > "${tmpdir}/${host_num}"
@@ -173,66 +174,99 @@ interactive_ip_scan() {
     done
     wait
 
-    # 汇总这批结果
     for host_num in "${batch[@]}"; do
-      local ip="${subnet}.${host_num}"
-      local status
-      status=$(cat "${tmpdir}/${host_num}" 2>/dev/null || echo "unknown")
-
-      # 已知 IP 也要标记为 used
-      if grep -qx "$ip" "$known_file" 2>/dev/null; then
-        status="used"
-      fi
-
-      results+=("${ip}:${status}")
+      ((++scanned))
     done
-    rm -rf "$tmpdir"
 
-    # 输出这批结果, 发现可用 IP 立即询问
-    for entry in "${results[@]}"; do
-      local ip="${entry%%:*}"
-      local st="${entry##*:}"
-
-      if [ "$st" == "used" ]; then
-        echo -e "    ${RED}● ${ip}  已占用${NC}"
-      else
-        echo -e "    ${GREEN}○ ${ip}  可用${NC}"
-        echo ""
-        echo -e "    ${GREEN}${BOLD}发现可用 IP: ${ip}${NC}"
-        echo -e "    ${CYAN}y${NC}) 使用此 IP"
-        echo -e "    ${CYAN}n${NC}) 跳过，继续扫描"
-        echo -e "    ${CYAN}q${NC}) 停止扫描，手动输入"
-
-        local choice
-        read -rp "$(printf "    ${CYAN}${BOLD}?${NC} 请选择 [y/n/q]: ")" choice
-
-        case "${choice,,}" in
-          y|"" )
-            rm -f "$known_file"
-            SELECTED_IP="$ip"
-            return 0
-            ;;
-          q )
-            echo ""
-            prompt CLOUD_IP_RAW "请输入 IP"
-            rm -f "$known_file"
-            SELECTED_IP="${CLOUD_IP_RAW%%/*}"
-            return 0
-            ;;
-          * )
-            # n / skip: 继续
-            echo ""
-            ;;
-        esac
-      fi
-    done
+    # 进度条
+    local progress=$((scanned * 100 / total))
+    local bar_width=30
+    local filled=$((progress * bar_width / 100))
+    local empty=$((bar_width - filled))
+    local bar="" i
+    for ((i = 0; i < filled; i++)); do bar+="█"; done
+    for ((i = 0; i < empty; i++)); do bar+="░"; done
+    echo -ne "\r  ${CYAN}[${bar}] ${scanned}/${total} (${progress}%)  扫描 ${subnet}.${batch[0]} ~ ${subnet}.${batch[-1]}${NC}   "
   done
 
-  # 全部扫完未选择
-  rm -f "$known_file"
-  warn "已扫描完 ${subnet}.${IP_START}~${subnet}.${IP_END}，未找到可用 IP"
-  prompt CLOUD_IP_RAW "请手动输入 IP"
-  SELECTED_IP="${CLOUD_IP_RAW%%/*}"
+  echo -e "\n"
+
+  # 收集结果
+  local used_ips=() free_ips=()
+  for ((h = IP_START; h <= IP_END; h++)); do
+    local ip="${subnet}.${h}"
+    local status
+    status=$(cat "${tmpdir}/${h}" 2>/dev/null || echo "unknown")
+    if [ "$status" == "used" ]; then
+      used_ips+=("$ip")
+    elif [ "$status" == "free" ]; then
+      free_ips+=("$ip")
+    fi
+  done
+
+  rm -rf "$tmpdir"
+
+  # ── 显示汇总表格 ──
+  echo -e "  ${BOLD}${GREEN}════════════════════════════════════════════${NC}"
+  echo -e "  ${BOLD}${GREEN}            IP 扫描结果汇总${NC}"
+  echo -e "  ${BOLD}${GREEN}════════════════════════════════════════════${NC}"
+  echo -e "  已占用: ${RED}${#used_ips[@]}${NC}    可用: ${GREEN}${#free_ips[@]}${NC}    总计: ${total}"
+  echo -e "  ${BOLD}${GREEN}────────────────────────────────────────────${NC}"
+
+  if [ ${#used_ips[@]} -gt 0 ]; then
+    echo -e "  ${RED}已占用 IP:${NC}"
+    local col=0
+    for ip in "${used_ips[@]}"; do
+      printf "    ${RED}● %-16s${NC}" "$ip"
+      ((++col))
+      if ((col >= 4)); then
+        echo ""
+        col=0
+      fi
+    done
+    ((col > 0)) && echo ""
+  fi
+
+  echo -e "  ${BOLD}${GREEN}────────────────────────────────────────────${NC}"
+
+  if [ ${#free_ips[@]} -eq 0 ]; then
+    echo -e "  ${YELLOW}未找到可用 IP${NC}"
+    echo -e "  ${BOLD}${GREEN}════════════════════════════════════════════${NC}"
+    warn "已扫描完 ${subnet}.${IP_START}~${subnet}.${IP_END}，未找到可用 IP"
+    prompt CLOUD_IP_RAW "请手动输入 IP"
+    SELECTED_IP="${CLOUD_IP_RAW%%/*}"
+    return 0
+  fi
+
+  echo -e "  ${GREEN}可用 IP:${NC}"
+  local idx=1 display_limit=20
+  for ip in "${free_ips[@]}"; do
+    echo -e "    ${CYAN}${idx}${NC}) ${GREEN}${ip}${NC}"
+    ((idx++))
+    if ((idx > display_limit)); then
+      echo -e "    ... 还有 $((${#free_ips[@]} - display_limit)) 个可用 IP"
+      break
+    fi
+  done
+
+  echo -e "  ${BOLD}${GREEN}════════════════════════════════════════════${NC}"
+
+  echo ""
+  echo -e "  ${CYAN}1-${#free_ips[@]}${NC}) 选择编号对应的 IP"
+  echo -e "  ${CYAN}m${NC}) 手动输入 IP"
+
+  local choice
+  read -rp "$(printf "  ${CYAN}${BOLD}?${NC} 请选择 [1/m]: ")" choice
+
+  if [[ "${choice,,}" == "m" ]]; then
+    prompt CLOUD_IP_RAW "请输入 IP"
+    SELECTED_IP="${CLOUD_IP_RAW%%/*}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#free_ips[@]} )); then
+    SELECTED_IP="${free_ips[$((choice-1))]}"
+  else
+    SELECTED_IP="${free_ips[0]}"
+    info "默认选择第一个可用 IP: ${SELECTED_IP}"
+  fi
 }
 
 # ── 生成 docker-compose.yaml ───────────────────────────────
@@ -333,7 +367,7 @@ prompt HOST_BRIDGE "网桥名称" "br0"
 # IP 分配方式选择
 echo ""
 echo -e "  ${BOLD}IP 分配方式:${NC}"
-echo -e "    ${CYAN}1${NC}) 自动探测 (${IP_SUBNET}.0/24, 每批 ${SCAN_CONCURRENCY} 个并发)"
+echo -e "    ${CYAN}1${NC}) 自动探测 (${IP_SUBNET}.0/24, 并发 ${SCAN_CONCURRENCY})"
 echo -e "    ${CYAN}2${NC}) 手动输入 IP"
 
 prompt IP_MODE "请选择 [1/2]" "1"
